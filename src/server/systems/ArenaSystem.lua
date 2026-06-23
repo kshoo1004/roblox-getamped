@@ -1,91 +1,93 @@
--- 서버: 아레나 관리 (탈락 판정 + 리스폰)
+-- Arena system: fall detection, respawn, kill tracking
+local Config = require(game.ReplicatedStorage.Shared.Config)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
-local FALL_Y = -50      -- 이 Y좌표 아래로 떨어지면 탈락
-local RESPAWN_TIME = 3  -- 리스폰까지 대기 시간(초)
-local SPAWN_POINTS = {  -- 스폰 위치 목록
-	Vector3.new(0, 10, 0),
-	Vector3.new(20, 10, 0),
-	Vector3.new(-20, 10, 0),
-	Vector3.new(0, 10, 20),
-}
+local ArenaSystem = {}
 
-local scores = {}
+local events = {}
+local onKillCallback = nil
+local fallCheckConnection = nil
 
-local function getScore(player)
-	if not scores[player] then
-		scores[player] = { kills = 0, falls = 0 }
-	end
-	return scores[player]
+-- player → last attacker (for kill credit)
+local lastHitBy = {}
+
+function ArenaSystem.RegisterHit(victim, attacker)
+	lastHitBy[victim] = attacker
 end
 
-local function respawnPlayer(player)
-	task.wait(RESPAWN_TIME)
-	if not player.Character then return end
-	local spawnPos = SPAWN_POINTS[math.random(#SPAWN_POINTS)]
-	local root = player.Character:FindFirstChild("HumanoidRootPart")
-	if root then
-		root.CFrame = CFrame.new(spawnPos)
-	end
-	-- 체력 회복
-	local humanoid = player.Character:FindFirstChild("Humanoid")
-	if humanoid then
-		humanoid.Health = humanoid.MaxHealth
-	end
+local function respawnAt(player, pos)
+	task.delay(3, function()
+		if not player.Character then return end
+		local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+		if hrp then
+			hrp.CFrame = CFrame.new(pos + Vector3.new(0, 5, 0))
+		end
+		local humanoid = player.Character:FindFirstChild("Humanoid")
+		if humanoid then
+			humanoid.Health = humanoid.MaxHealth
+		end
+	end)
 end
 
--- 탈락 감지 루프
-RunService.Heartbeat:Connect(function()
-	for _, player in ipairs(Players:GetPlayers()) do
-		local char = player.Character
-		if not char then continue end
-		local root = char:FindFirstChild("HumanoidRootPart")
-		if not root then continue end
+function ArenaSystem.Init(evts, onKill)
+	events = evts
+	onKillCallback = onKill
 
-		if root.Position.Y < FALL_Y then
-			local score = getScore(player)
-			score.falls += 1
+	-- Disconnect previous fall check if any
+	if fallCheckConnection then
+		fallCheckConnection:Disconnect()
+	end
 
-			-- 탈락 알림
-			local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
-			if Remotes then
-				local FallEvent = Remotes:FindFirstChild("PlayerFell")
-				if FallEvent then
-					FallEvent:FireAllClients({ player = player.Name, falls = score.falls })
+	local spawnPoints = {
+		Vector3.new(-70, 2, -60), Vector3.new(50, 2, -60),
+		Vector3.new(-70, 2, 60),  Vector3.new(50, 2, 60),
+		Vector3.new(0, 2, -70),   Vector3.new(0, 2, 70),
+	}
+
+	fallCheckConnection = RunService.Heartbeat:Connect(function()
+		for _, player in ipairs(Players:GetPlayers()) do
+			local char = player.Character
+			if not char then continue end
+			local hrp = char:FindFirstChild("HumanoidRootPart")
+			if not hrp then continue end
+
+			if hrp.Position.Y < Config.FALL_Y then
+				-- Kill credit
+				local killer = lastHitBy[player]
+				if killer and killer ~= player and killer.Character then
+					if onKillCallback then
+						onKillCallback(killer, player)
+					end
+				end
+				lastHitBy[player] = nil
+
+				-- Humanoid kill
+				local humanoid = char:FindFirstChild("Humanoid")
+				if humanoid then humanoid.Health = 0 end
+
+				-- Respawn
+				local pos = spawnPoints[math.random(#spawnPoints)]
+				respawnAt(player, pos)
+
+				if events.StatusEvent then
+					events.StatusEvent:FireAllClients("FELL", { player = player.Name })
 				end
 			end
-
-			-- 리스폰
-			respawnPlayer(player)
-		end
-	end
-end)
-
--- 처치 감지
-local function onCharacterAdded(player)
-	local char = player.Character or player.CharacterAdded:Wait()
-	local humanoid = char:WaitForChild("Humanoid")
-
-	humanoid.Died:Connect(function()
-		-- 크레딧 태그로 처치자 확인
-		local tag = humanoid:FindFirstChild("creator")
-		if tag and tag.Value then
-			local killer = tag.Value
-			local killerScore = getScore(killer)
-			killerScore.kills += 1
 		end
 	end)
 end
 
-Players.PlayerAdded:Connect(function(player)
-	scores[player] = { kills = 0, falls = 0 }
-	player.CharacterAdded:Connect(function()
-		onCharacterAdded(player)
-	end)
-end)
+function ArenaSystem.Stop()
+	if fallCheckConnection then
+		fallCheckConnection:Disconnect()
+		fallCheckConnection = nil
+	end
+	lastHitBy = {}
+end
 
 Players.PlayerRemoving:Connect(function(player)
-	scores[player] = nil
+	lastHitBy[player] = nil
 end)
+
+return ArenaSystem
